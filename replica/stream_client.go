@@ -1443,11 +1443,16 @@ func (s *StreamClient) GetLastTxnID(database string) uint64 {
 func (s *StreamClient) getOrCreateWaitQueue(database string) *TxnWaitQueue {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if q, ok := s.txnWaitQueues[database]; ok {
-		return q
+	q, ok := s.txnWaitQueues[database]
+	if !ok {
+		q = NewTxnWaitQueue()
+		s.txnWaitQueues[database] = q
 	}
-	q := NewTxnWaitQueue()
-	s.txnWaitQueues[database] = q
+
+	// WaitForTxn checks lastTxnID before registering with the queue. Seed the
+	// watermark from the same lock so a transaction that completed in between
+	// cannot leave the new waiter blocked forever.
+	q.NotifyUpTo(s.lastTxnID[database])
 	return q
 }
 

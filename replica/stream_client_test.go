@@ -718,6 +718,25 @@ func TestStreamClient_LastTxnIDTracking(t *testing.T) {
 	client.mu.RUnlock()
 }
 
+func TestStreamClient_WaitQueueSeededFromLastTxnID(t *testing.T) {
+	client := &StreamClient{
+		lastTxnID:     map[string]uint64{"testdb": 100},
+		txnWaitQueues: make(map[string]*TxnWaitQueue),
+	}
+
+	q := client.getOrCreateWaitQueue("testdb")
+	if err := q.Wait(context.Background(), 100); err != nil {
+		t.Fatalf("expected txnID 100 to be treated as replicated, got %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	if err := q.Wait(ctx, 101); err != context.DeadlineExceeded {
+		t.Fatalf("expected txnID 101 to remain blocked, got %v", err)
+	}
+}
+
 // TestStreamClient_ReconnectConfig tests reconnect configuration
 func TestStreamClient_ReconnectConfig(t *testing.T) {
 	dbMgr, clock, _, cleanup := setupStreamClientTest(t)

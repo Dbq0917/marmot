@@ -135,7 +135,7 @@ func TestTxnWaitQueue_NotifyBeforeWait(t *testing.T) {
 		done <- q.Wait(context.Background(), 100)
 	}()
 
-	// This should still wait since queue doesn't track history
+	// txnID 100 is beyond the watermark of 50, so the waiter remains blocked.
 	time.Sleep(20 * time.Millisecond)
 
 	if q.Len() != 1 {
@@ -237,6 +237,68 @@ func TestTxnWaitQueue_PartialNotify(t *testing.T) {
 
 	if !notified[1].Load() || !notified[2].Load() {
 		t.Error("all waiters should be notified")
+	}
+}
+
+func TestTxnWaitQueue_NonContiguousNotifications(t *testing.T) {
+	q := NewTxnWaitQueue()
+
+	txnIDs := []uint64{100, 101, 105, 110, 120}
+	results := make(chan error, len(txnIDs))
+
+	for _, txnID := range txnIDs {
+		go func(id uint64) {
+			results <- q.Wait(context.Background(), id)
+		}(txnID)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for q.Len() != len(txnIDs) {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d waiters, got %d", len(txnIDs), q.Len())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Commits have holes: each notification advances the watermark and wakes
+	// every waiter at or below it, even when intermediate IDs never committed.
+	for _, txnID := range []uint64{100, 103, 107, 112, 130} {
+		q.NotifyUpTo(txnID)
+	}
+
+	for range txnIDs {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Errorf("waiter got error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("waiter not notified")
+		}
+	}
+
+	if q.Len() != 0 {
+		t.Fatalf("expected 0 waiters after notifications, got %d", q.Len())
+	}
+}
+
+func TestTxnWaitQueue_DuplicateNotifyDoesNotAdvanceWatermark(t *testing.T) {
+	q := NewTxnWaitQueue()
+
+	q.NotifyUpTo(100)
+	q.NotifyUpTo(100)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	if err := q.Wait(ctx, 101); err != context.DeadlineExceeded {
+		t.Fatalf("expected waiter for txnID 101 to remain blocked, got %v", err)
+	}
+
+	// A waiter at or below the watermark completes immediately, including one
+	// registered after the original notification.
+	if err := q.Wait(context.Background(), 100); err != nil {
+		t.Fatalf("expected waiter for notified txnID 100 to complete, got %v", err)
 	}
 }
 

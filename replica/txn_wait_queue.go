@@ -12,10 +12,12 @@ type txnWaiter struct {
 }
 
 // TxnWaitQueue manages waiters for transaction replication.
-// Uses sorted list for O(k) notification where k = satisfied waiters.
+// Uses a sorted list and a monotonic watermark so each notification only
+// inspects the waiters it satisfies.
 type TxnWaitQueue struct {
-	mu      sync.Mutex
-	waiters []txnWaiter // Sorted by txnID ascending
+	mu       sync.Mutex
+	waiters  []txnWaiter // Sorted by txnID ascending
+	notified uint64      // Highest txnID observed by NotifyUpTo
 }
 
 func NewTxnWaitQueue() *TxnWaitQueue {
@@ -30,6 +32,11 @@ func (q *TxnWaitQueue) Wait(ctx context.Context, txnID uint64) error {
 	ch := make(chan struct{})
 
 	q.mu.Lock()
+	if txnID <= q.notified {
+		q.mu.Unlock()
+		return nil
+	}
+
 	// Insert in sorted order (binary search for position)
 	i := sort.Search(len(q.waiters), func(i int) bool {
 		return q.waiters[i].txnID >= txnID
@@ -57,23 +64,26 @@ func (q *TxnWaitQueue) Wait(ctx context.Context, txnID uint64) error {
 	}
 }
 
-// NotifyUpTo wakes all waiters with txnID <= the given txnID.
+// NotifyUpTo advances the committed watermark and wakes all waiters with
+// txnID <= the watermark. Transaction IDs may have gaps, and a notification
+// that does not advance the watermark is ignored.
 // Called when a transaction is applied from the replication stream.
 // O(log n) search + O(k) notifications where k = satisfied waiters.
 func (q *TxnWaitQueue) NotifyUpTo(txnID uint64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if len(q.waiters) == 0 {
+	if txnID <= q.notified {
 		return
 	}
+	q.notified = txnID
 
-	// Binary search for first waiter with txnID > txnID
+	// Binary search for first waiter beyond the new watermark.
 	i := sort.Search(len(q.waiters), func(i int) bool {
-		return q.waiters[i].txnID > txnID
+		return q.waiters[i].txnID > q.notified
 	})
 
-	// Close channels for all waiters with txnID <= txnID
+	// Close channels for all waiters with txnID <= watermark.
 	for j := 0; j < i; j++ {
 		close(q.waiters[j].ch)
 	}
